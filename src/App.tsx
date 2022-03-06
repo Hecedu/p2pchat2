@@ -1,16 +1,17 @@
 import React, { useEffect, useRef, useState } from 'react';
 import './App.css';
 import Peer from 'peerjs';
+import { send } from 'process';
 
 type PeerMessage = {
   id: number
-  vectorClock: NodeClock[]
+  delivered: NodeClock[]
   message: string
-  author_node_id: string
+  sender_id: string
 };
 type NodeClock = {
   node_id: string
-  lamportClock: number
+  delivered: number
 }
 function randId(): string {
   let roomLength = 6
@@ -25,88 +26,101 @@ function randId(): string {
 }
 
 function App() {
-  const [peer] = useState<Peer>(new Peer(randId(), {
+  const [myPeerClient] = useState<Peer>(new Peer(randId(), {
     host: '45.79.192.219',
     port: 9000,
     path: '/myapp'
   }))
   const [chatLog, setChatLog] = useState<string[]>([''])
-  const [receivedMessageIds, setReceivedMessageIds] = useState<number[]>([])
+  const [receivedMessages, setReceivedMessages] = useState<number[]>([])
   const [listOfConnections, setListOfConnections] = useState<Peer.DataConnection[]>([])
-  const [vectorClock, setVectorClock] = useState<NodeClock[]>([{ node_id: peer.id, lamportClock: 0 }])
+  const [delivered, setDelivered] = useState<NodeClock[]>([])
   const [buffer, setBuffer] = useState<PeerMessage[]>([])
   const [sendSequence, setSendSequence] = useState<number>(0)
-  const receivedMessagesRef = useRef<number[]>(receivedMessageIds)
+  const receivedMessagesRef = useRef<number[]>(receivedMessages)
   const connectionsRef = useRef<Peer.DataConnection[]>(listOfConnections)
-  const vectorClockRef = useRef<NodeClock[]>(vectorClock)
+  const deliveredRef = useRef<NodeClock[]>(delivered)
   const bufferRef = useRef<PeerMessage[]>(buffer)
 
   connectionsRef.current = listOfConnections
-  receivedMessagesRef.current = receivedMessageIds
-  vectorClockRef.current = vectorClock
+  receivedMessagesRef.current = receivedMessages
+  deliveredRef.current = delivered
   bufferRef.current = buffer
-
   var inputBoxConnectionId = ''
   var inputBoxChatMessage = ''
 
   useEffect(() => {
-    peer.on('connection', function (conn) {
-
+    myPeerClient.on('connection', function (conn) {
+      console.log('New connection from' + conn.peer)
       conn.on('data', function (data: PeerMessage) {
+        //check if id is in delivered
+
         console.log(data)
+        console.log(deliveredRef.current)
         //check in incoming connection is not already in list
-        if (connectionsRef.current.findIndex(x => x.peer === conn.peer) === -1) {
-          var connection = peer.connect(conn.peer)
+        if (connectionsRef.current.findIndex(x => x.peer === data.sender_id) === -1 && data.sender_id !== myPeerClient.id) {
+          var connection = myPeerClient.connect(data.sender_id)
           setListOfConnections(currentListOfConnections => ([...currentListOfConnections, connection]))
         }
         //check if message is already received
         //if not broadcast message to all connections
-        if (receivedMessagesRef.current.findIndex(x => x === data.id) === -1) {
-          setReceivedMessageIds(currentReceivedMessageIds => ([...currentReceivedMessageIds, data.id]))
-          const broadcastedMessage: PeerMessage = { id: data.id, vectorClock: data.vectorClock, message: data.message, author_node_id: data.author_node_id }
+        if (receivedMessagesRef.current.findIndex(message => message === data.id) === -1) {
+          const broadcastedMessage: PeerMessage = { id: data.id, delivered: data.delivered, message: data.message, sender_id: data.sender_id }
           connectionsRef.current.forEach(x => x.send(broadcastedMessage))
         }
+        //add message id to received messages
+        setReceivedMessages(currentReceivedMessages => ([...currentReceivedMessages, data.id]))
         //add message to buffer
         setBuffer(buffer => [...buffer, data])
       });
     });
   }, []);
-  
+
   useEffect(() => {
-    var updated_vector_clock = vectorClockRef.current
-    buffer.forEach(message => {
-      var smaller_than_vector_clock = false
-      message.vectorClock.forEach(clock => {
+    var updated_vector_clock = deliveredRef.current
+    bufferRef.current.forEach(message => {
+      //check if sent by this node
+      if (message.sender_id === myPeerClient.id) {
+        if (receivedMessagesRef.current.findIndex(x => x === message.id) === -1) {
+          setReceivedMessages(currentReceivedMessageIds => ([...currentReceivedMessageIds, message.id]))
+          setChatLog(currentChatLog => ([...currentChatLog, parseMessage(message, deliveredRef.current)]))
+        }
+        return
+      }
+      //check if sender id is in vector clock, if not initialize it
+      if (deliveredRef.current.findIndex(clock => clock.node_id === message.sender_id) === -1) {
+        updated_vector_clock = [...updated_vector_clock, { node_id: message.sender_id, delivered: 0 }]
+      }
+      var smaller_than_delivered = true
+      message.delivered.forEach(clock => {
         //check if clock id is in vector clock, if not add it
-        if (vectorClockRef.current.findIndex(x => x.node_id === clock.node_id) === -1) {
-          updated_vector_clock = [...updated_vector_clock, clock]
-          smaller_than_vector_clock = true
+        if (deliveredRef.current.findIndex(clock => clock.node_id === clock.node_id) === -1) {
+          //check if its own id
+          if (clock.node_id !== myPeerClient.id) {
+            updated_vector_clock = [...updated_vector_clock, clock]
+          }
           return
         }
         //check if clock is smaller than current clock
-        var corresponding_clock = vectorClockRef.current.find(x => x.node_id === clock.node_id)
-        if (corresponding_clock){
-          if (clock.lamportClock <= corresponding_clock.lamportClock) {
-            smaller_than_vector_clock = true
-          }
-          else {
-            console.log(clock.lamportClock, corresponding_clock.lamportClock)
-            smaller_than_vector_clock = false
+        var corresponding_clock = deliveredRef.current.find(x => x.node_id === clock.node_id)
+        if (corresponding_clock) {
+          if (clock.delivered > corresponding_clock?.delivered) {
+            smaller_than_delivered = false
           }
         }
       })
-      if (smaller_than_vector_clock) {
+      if (smaller_than_delivered) {
         //update vector clock with a copy of it where the message sender id lamport clock is incremented
-        var new_vector_clock = updated_vector_clock.map(x => {
-          if (x.node_id === message.author_node_id) {
-            return { node_id: x.node_id, lamportClock: x.lamportClock + 1 }
+        var new_vector_clock = updated_vector_clock.map(old_clock => {
+          if (old_clock.node_id === message.sender_id) {
+            return { node_id: old_clock.node_id, delivered: old_clock.delivered + 1 }
           }
           else {
-            return x
+            return old_clock
           }
         })
-        setVectorClock(new_vector_clock)
-        setChatLog(currentChatLog => ([...currentChatLog, parseMessage(message)]))
+        setDelivered(delivered => (new_vector_clock))
+        setChatLog(currentChatLog => ([...currentChatLog, parseMessage(message, new_vector_clock)]))
         //remove from buffer
         setBuffer(buffer => buffer.filter(x => x.id !== message.id))
       }
@@ -114,28 +128,24 @@ function App() {
         console.log('kept in buffer')
       }
     })
-  
-    return () => {
-
-    }
   }, [buffer])
-  
 
-  function parseMessage(message: PeerMessage) {
 
+  function parseMessage(message: PeerMessage, updatedClock: NodeClock[]) {
     //create a string for the vector clock with the format: (node_id:lamport_clock)
     var vector_clock_string = ''
-    message.vectorClock.forEach(clock => {
-      vector_clock_string += `(${clock.node_id}:${clock.lamportClock})`
+    updatedClock.forEach(clock => {
+      vector_clock_string += `(${clock.node_id}:${clock.delivered})`
     })
-    return ` ${vector_clock_string}: ${message.message}`
+    return `Sender(${message.sender_id}) SendSequence(${sendSequence}) Vector Clock(${vector_clock_string}): ${message.message}`
   }
 
   function onConnectionIdChange(e: React.ChangeEvent<HTMLInputElement>) {
     inputBoxConnectionId = e.target.value
   }
   function onAddNewConnection(id: string) {
-    const conn = peer.connect(id);
+    const conn = myPeerClient.connect(id);
+    deliveredRef.current.push({ node_id: conn.peer, delivered: 0 })
     setListOfConnections(prev => [...prev, conn])
   }
   function onChatChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -145,25 +155,25 @@ function App() {
     onAddNewConnection(inputBoxConnectionId)
   }
   function onSubmitChat() {
-    var send_vector_clock = vectorClockRef.current.map(x => {
-      if (x.node_id === peer.id) {
-        return { node_id: x.node_id, lamportClock: sendSequence }
+    var deps = deliveredRef.current.map(x => {
+      if (x.node_id === myPeerClient.id) {
+        return { node_id: x.node_id, delivered: sendSequence }
       }
       else {
         return x
       }
     })
-    var message: PeerMessage = { id: Math.floor(Math.random() * 1000000), vectorClock:send_vector_clock, message: inputBoxChatMessage, author_node_id: peer.id }
-    setSendSequence(sendSequence => sendSequence + 1)
+    var message: PeerMessage = { id: Math.floor(Math.random() * 1000000), delivered: deps, message: inputBoxChatMessage, sender_id: myPeerClient.id }
     listOfConnections.forEach(connection => {
       connection.send(message)
     });
+    setSendSequence(currentSendSequence => currentSendSequence + 1)
     setBuffer(buffer => [...buffer, message])
   }
 
   return (
     <div className="container">
-      <h1>ID: {peer.id}</h1>
+      <h1>ID: {myPeerClient.id}</h1>
       <div>
         <label>
           Connect to id:
